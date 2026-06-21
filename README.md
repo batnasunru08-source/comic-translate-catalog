@@ -78,7 +78,7 @@ result/<input_dir_basename>_translate/
 
 ```bash
 python translate_catalog.py \
-    --in "./[BDOne] Prince_ Chapter" \
+    --in "/path/to/images" \
     --source en \
     --target rus
 ```
@@ -94,7 +94,7 @@ inpaint details) включите debug-режим:
 
 ```bash
 TRANSLATE_DEBUG=1 python translate_catalog.py \
-    --in "example_catalog" \
+    --in "/path/to/images" \
     --source en \
     --target rus
 ```
