@@ -1,8 +1,6 @@
-# translate_catalog
+# comic-translate-catalog
 
-CLI для пакетного перевода изображений из каталога. Использует ту же логику
-OCR + перевод + inpaint + render, что и FastAPI-сервер, но запускается
-отдельным процессом без HTTP.
+CLI для пакетного перевода изображений из каталога.
 
 ## Структура
 
@@ -16,13 +14,11 @@ translate_catalog/
 ├── install.sh               # .venv + pip install
 ├── download-model.sh        # скачать GGUF
 ├── result/                  # создаётся при первом запуске
-└── .venv/                   # создаётся install.sh
 ```
 
 ## Установка
 
 ```bash
-cd /home/batnasun/translate_catalog
 bash install.sh
 ```
 
@@ -89,14 +85,6 @@ python translate_catalog.py \
 
 Результат: `result/[BDOne] Prince_ Chapter_translate/` с 26 PNG (по числу .webp).
 
-## Заметки
-
-- Логика перевода скопирована из `server/app/` (vendor). При правках в
-  `server/app/*.py` нужно вручную синхронизировать изменения.
-- Между изображениями вызывается `HyMt2Translator.reset()` (KV-кеш чистится)
-  — VRAM возвращается к исходному уровню.
-- OCR-кеш в `app.pipeline` (LRU, 8 записей) переиспользуется между
-  изображениями в рамках одного запуска.
 
 ## Отладка
 
@@ -106,7 +94,7 @@ inpaint details) включите debug-режим:
 
 ```bash
 TRANSLATE_DEBUG=1 python translate_catalog.py \
-    --in "./[BDOne] Prince_ Chapter" \
+    --in "example_catalog" \
     --source en \
     --target rus
 ```
