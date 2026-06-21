@@ -1,0 +1,17 @@
+torch
+torchvision
+numpy>=2.2.0,<3.0.0
+pillow>=11.0.0
+opencv-python>=4.11.0
+transformers>=5.4.0
+accelerate>=1.10.0
+
+# PaddleOCR 3.5.0 + PaddleX (engine='transformers' работает без PaddlePaddle)
+paddleocr>=3.5.0
+paddlex>=3.5.2
+
+# llama-cpp-python для GGUF инференса.
+# CPU:  pip install llama-cpp-python
+# GPU:  CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir
+# Не ставим автоматически — нужна правильная сборка под железо.
+# install.sh ставит правильный вариант после создания .venv.

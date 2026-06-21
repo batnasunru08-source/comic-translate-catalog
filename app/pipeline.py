@@ -1,0 +1,591 @@
+from __future__ import annotations
+
+import shutil
+import tempfile
+from io import BytesIO
+from time import perf_counter
+from pathlib import Path
+from typing import Any
+import json
+import re
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from .detector import CandidateBox
+from .models import TextBlock
+from .ocr import recognize_blocks
+from .renderer import inpaint_text, render_translations
+from .utils import debug_print, load_translation_filter, sha1_bytes
+
+
+# Кеш распознанных OCR-блоков по (digest, source_ocr_lang).
+# LRU-стиль: при переполнении удаляем самую старую запись.
+# TextBlock — mutable (translated_text), поэтому храним и отдаём копии.
+_OCR_CACHE: dict[tuple[str, str], list[TextBlock]] = {}
+_OCR_CACHE_MAX = 8
+
+
+def _overlap_len(a1: int, a2: int, b1: int, b2: int) -> int:
+    return max(0, min(a2, b2) - max(a1, b1))
+
+
+def _axis_gap(a1: int, a2: int, b1: int, b2: int) -> int:
+    return max(0, max(a1, b1) - min(a2, b2))
+
+
+def _block_area(block: TextBlock) -> int:
+    x1, y1, x2, y2 = block.bounds
+    return max(1, x2 - x1) * max(1, y2 - y1)
+
+
+def _block_center(block: TextBlock) -> tuple[float, float]:
+    x1, y1, x2, y2 = block.bounds
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def looks_translatable(text: str) -> bool:
+    """Фильтрует мусор: одиночные символы, коды, артефакты OCR.
+
+    Правила:
+    - минимум 2 символа
+    - доля буквенно-цифровых символов >= 40%
+    - минимум 2 буквы
+    - не повторяющийся символ ("####", "....")
+    - не артефакты OCR ("\\\\", "$...$", "{}", "[]")
+    - не набор одиночных букв ("W B", "V T", "HM? J")
+    - не повторяющийся слог ("ofof", "abab")
+    - не водяной знак/подпись ("pixiv MadBull")
+
+    Списки исключений загружаются из data/translation_filter.json.
+    Файл проверяется на изменение при каждом вызове.
+    """
+    text = (text or "").strip()
+    if len(text) < 2:
+        return False
+    alnum = sum(c.isalnum() for c in text)
+    if alnum / len(text) < 0.40:
+        return False
+    letters = sum(c.isalpha() for c in text)
+    if letters < 2:
+        return False
+    if len(set(text.replace(" ", ""))) <= 1:
+        return False
+    if "\\" in text:
+        return False
+    if re.search(r'\$[^$]*\$', text):
+        return False
+    if re.search(r'[\{\}\[\]]', text):
+        return False
+
+    # Набор одиночных букв: "W B", "V T", "HM? J"
+    words = text.split()
+    alpha_words = [re.sub(r'[^a-zA-Z\u0400-\u04FF\u3040-\u30FF\u4E00-\u9FFF]', '', w)
+                   for w in words]
+    alpha_words = [w for w in alpha_words if w]
+    if alpha_words and all(len(w) == 1 for w in alpha_words):
+        return False
+    if len(alpha_words) >= 2:
+        single_ratio = sum(1 for w in alpha_words if len(w) == 1) / len(alpha_words)
+        # Для коротких фраз (≤ 3 слов) порог ниже: "HM? J" → 1/2 = 0.5 → skip
+        threshold = 0.5 if len(alpha_words) <= 3 else 0.6
+        if single_ratio >= threshold:
+            return False
+
+    # Повторяющийся слог: "ofof", "abab" (но не "haha", "mama")
+    t_clean = text.lower().replace(" ", "")
+    filter_config = load_translation_filter()
+    known_repeats = filter_config["known_repeats"]
+    if 4 <= len(t_clean) <= 8 and t_clean.isalpha() and t_clean not in known_repeats:
+        half = len(t_clean) // 2
+        if t_clean[:half] == t_clean[half:half * 2]:
+            return False
+
+    # Водяные знаки / подписи авторов
+    text_lower = text.lower()
+    if any(token in text_lower for token in filter_config["watermark_tokens"]):
+        return False
+
+    # Мусорные токены: артефакты OCR, случайные буквы и т.п.
+    if any(token in text_lower for token in filter_config["noise_tokens"]):
+        return False
+
+    # SFX (звукоподражания манги): ALL_CAPS, ≤2 слов, ≤10 букв.
+    # "HUMP THRU", "PLAP TUM", "SQUIRT" — ономатопея, не нужен перевод.
+    # "I WANT TO CUM!" — реальная речь (3 слова, >10 букв) — пропускаем.
+    if text.isupper() and len(text) <= 15:
+        alpha_chars = sum(c.isalpha() for c in text)
+        if alpha_chars <= 10 and len(text.split()) <= 2:
+            return False
+
+    return True
+
+
+def _component_bounds(items: list[TextBlock]) -> tuple[int, int, int, int]:
+    xs = [point[0] for item in items for point in item.box]
+    ys = [point[1] for item in items for point in item.box]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _cluster_blocks_into_regions(
+    blocks: list[TextBlock],
+    image_shape: tuple[int, ...],
+) -> list[Any]:
+    """Кластеризует bounding boxes из OCR в регионы через морфологическое dilation.
+
+    Возвращает список CandidateBox — объединённые области текстовых блоков.
+    В отличие от detect_text_regions (threshold+contours на всём изображении),
+    этот метод строит регионы из реальных bbox OCR — точнее и быстрее.
+    """
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if not blocks or h == 0 or w == 0:
+        return []
+
+    canvas = np.zeros((h, w), dtype=np.uint8)
+    for block in blocks:
+        x1, y1, x2, y2 = block.bounds
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        x2 = min(w, int(x2))
+        y2 = min(h, int(y2))
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), 255, -1)
+
+    # Dilation соединяет близкие блоки в один регион.
+    # Прямоугольное ядро: узкое по X (отдельные пузыри не сливать),
+    # широкое по Y (вертикальные стеки слов в одном пузыре соединять).
+    kernel_x = max(16, w // 35)
+    kernel_y = max(30, h // 18)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_x, kernel_y))
+    dilated = cv2.dilate(canvas, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    regions: list[Any] = []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        regions.append(CandidateBox(x1=x, y1=y, x2=x + bw, y2=y + bh))
+
+    regions.sort(key=lambda r: (r.y1, r.x1))
+    return regions
+
+
+def _assign_region_ids(
+    blocks: list[TextBlock],
+    image_rgb: np.ndarray,
+) -> tuple[list[int | None], list[Any]]:
+    regions = _cluster_blocks_into_regions(blocks, image_rgb.shape)
+    if not regions:
+        return [None] * len(blocks), []
+
+    region_ids: list[int | None] = [None] * len(blocks)
+    for i, block in enumerate(blocks):
+        cx, cy = _block_center(block)
+        matched: list[tuple[int, int]] = []
+
+        for region_index, region in enumerate(regions):
+            inside = region.x1 <= cx <= region.x2 and region.y1 <= cy <= region.y2
+            if inside:
+                matched.append((region.area, region_index))
+
+        if matched:
+            matched.sort()
+            region_ids[i] = matched[0][1]
+        else:
+            region_ids[i] = None
+
+    return region_ids, regions
+
+
+def _blocks_are_neighbors(
+    a: TextBlock,
+    b: TextBlock,
+    region_a: int | None,
+    region_b: int | None,
+) -> bool:
+    if region_a is not None and region_b is not None and region_a != region_b:
+        return False
+
+    ax1, ay1, ax2, ay2 = a.bounds
+    bx1, by1, bx2, by2 = b.bounds
+
+    aw = max(1, ax2 - ax1)
+    ah = max(1, ay2 - ay1)
+    bw = max(1, bx2 - bx1)
+    bh = max(1, by2 - by1)
+
+    x_overlap = _overlap_len(ax1, ax2, bx1, bx2)
+    y_overlap = _overlap_len(ay1, ay2, by1, by2)
+    x_overlap_ratio = x_overlap / float(max(1, min(aw, bw)))
+    y_overlap_ratio = y_overlap / float(max(1, min(ah, bh)))
+
+    h_gap = _axis_gap(ax1, ax2, bx1, bx2)
+    v_gap = _axis_gap(ay1, ay2, by1, by2)
+
+    acx, acy = _block_center(a)
+    bcx, bcy = _block_center(b)
+    center_dx = abs(acx - bcx)
+    center_dy = abs(acy - bcy)
+
+    a_tall = ah > aw * 1.15
+    b_tall = bh > bw * 1.15
+
+    vertical_neighbor = (
+        x_overlap_ratio >= 0.32
+        and center_dx <= max(16, int(min(aw, bw) * 0.45))
+        and v_gap <= max(12, int(max(ah, bh) * 0.60))
+    )
+    horizontal_neighbor = (
+        y_overlap_ratio >= 0.58
+        and center_dy <= max(10, int(min(ah, bh) * 0.32))
+        and h_gap <= max(14, int(min(aw, bw) * 0.25))
+    )
+
+    if horizontal_neighbor and a_tall and b_tall and h_gap > max(8, int(min(aw, bw) * 0.22)):
+        horizontal_neighbor = False
+
+    touching = h_gap == 0 and v_gap == 0 and (x_overlap_ratio >= 0.22 or y_overlap_ratio >= 0.22)
+    return touching or vertical_neighbor or horizontal_neighbor
+
+
+def _split_component_by_x_gap(items: list[TextBlock]) -> list[list[TextBlock]]:
+    if len(items) < 2:
+        return [items]
+
+    ordered = sorted(items, key=lambda item: _block_center(item)[0])
+    centers = [_block_center(item)[0] for item in ordered]
+    widths = [max(1, item.bounds[2] - item.bounds[0]) for item in ordered]
+    median_width = float(np.median(np.array(widths, dtype=np.float32))) if widths else 0.0
+
+    best_index: int | None = None
+    best_gap = 0.0
+
+    for split_index in range(2, len(ordered) - 1):
+        gap = centers[split_index] - centers[split_index - 1]
+        threshold = max(
+            26.0,
+            median_width * 0.75,
+            float(min(widths[split_index - 1], widths[split_index])) * 0.85,
+        )
+        if gap < threshold:
+            continue
+
+        left_items = ordered[:split_index]
+        right_items = ordered[split_index:]
+        lx1, ly1, lx2, ly2 = _component_bounds(left_items)
+        rx1, ry1, rx2, ry2 = _component_bounds(right_items)
+
+        left_height = max(1, ly2 - ly1)
+        right_height = max(1, ry2 - ry1)
+        y_overlap = _overlap_len(ly1, ly2, ry1, ry2)
+        if y_overlap < max(18, int(min(left_height, right_height) * 0.20)):
+            continue
+
+        left_width = max(1, lx2 - lx1)
+        right_width = max(1, rx2 - rx1)
+        x_overlap = _overlap_len(lx1, lx2, rx1, rx2)
+        if x_overlap > max(8, int(min(left_width, right_width) * 0.08)):
+            continue
+
+        if gap > best_gap:
+            best_gap = gap
+            best_index = split_index
+
+    if best_index is None:
+        return [items]
+
+    left = ordered[:best_index]
+    right = ordered[best_index:]
+    split_groups: list[list[TextBlock]] = []
+    split_groups.extend(_split_component_by_x_gap(left))
+    split_groups.extend(_split_component_by_x_gap(right))
+    return split_groups
+
+
+def _sort_group_items(items: list[TextBlock]) -> list[TextBlock]:
+    sorted_items = sorted(items, key=lambda b: (b.bounds[1], b.bounds[0]))
+    lines: list[dict[str, Any]] = []
+
+    for item in sorted_items:
+        x1, y1, x2, y2 = item.bounds
+        item_center_y = (y1 + y2) / 2.0
+        item_height = max(1, y2 - y1)
+        placed = False
+
+        for line in lines:
+            avg_height = max(1.0, float(line["avg_height"]))
+            if abs(item_center_y - float(line["center_y"])) <= max(12.0, avg_height * 0.40):
+                # X-перекрытие: блоки из разных пузырей не должны
+                # сливаться в одну «линию» только по Y-близости.
+                line_x1 = min(i.bounds[0] for i in line["items"])
+                line_x2 = max(i.bounds[2] for i in line["items"])
+                x_overlap = max(0, min(line_x2, x2) - max(line_x1, x1))
+                min_w = min(line_x2 - line_x1, x2 - x1)
+                if x_overlap < max(6, int(min_w * 0.08)):
+                    continue
+                line["items"].append(item)
+                count = len(line["items"])
+                line["center_y"] = ((float(line["center_y"]) * (count - 1)) + item_center_y) / count
+                line["avg_height"] = ((avg_height * (count - 1)) + item_height) / count
+                placed = True
+                break
+
+        if not placed:
+            lines.append(
+                {
+                    "center_y": item_center_y,
+                    "avg_height": float(item_height),
+                    "items": [item],
+                }
+            )
+
+    ordered: list[TextBlock] = []
+    for line in sorted(lines, key=lambda entry: float(entry["center_y"])):
+        ordered.extend(sorted(line["items"], key=lambda block: block.bounds[0]))
+    return ordered
+
+
+def group_blocks(
+    blocks: list[TextBlock],
+    image_rgb: np.ndarray,
+    region_ids: list[int | None] | None = None,
+) -> list[TextBlock]:
+    if not blocks:
+        return []
+
+    blocks = sorted(blocks, key=lambda b: (b.bounds[1], b.bounds[0]))
+    if region_ids is None:
+        region_ids, _ = _assign_region_ids(blocks, image_rgb)
+
+    adjacency: list[list[int]] = [[] for _ in blocks]
+    for left_index, left_block in enumerate(blocks):
+        _, left_y1, _, left_y2 = left_block.bounds
+        left_h = max(1, left_y2 - left_y1)
+        # Адаптивный порог разрыва по Y: ~2.5 высоты текущего блока, но не
+        # меньше 50px (для очень маленьких блоков) и не больше 7% высоты
+        # изображения (для очень больших). Жёстче фиксированных 140px на
+        # маленьких изображениях, мягче — на больших.
+        y_break = max(50, min(int(left_h * 2.5), int(image_rgb.shape[0] * 0.07)))
+        for right_index in range(left_index + 1, len(blocks)):
+            right_block = blocks[right_index]
+            _, right_y1, _, _ = right_block.bounds
+            if right_y1 - left_y2 > y_break:
+                break
+
+            if _blocks_are_neighbors(
+                left_block,
+                right_block,
+                region_ids[left_index],
+                region_ids[right_index],
+            ):
+                adjacency[left_index].append(right_index)
+                adjacency[right_index].append(left_index)
+
+    merged: list[TextBlock] = []
+    visited = [False] * len(blocks)
+    for start_index in range(len(blocks)):
+        if visited[start_index]:
+            continue
+
+        stack = [start_index]
+        component: list[TextBlock] = []
+        while stack:
+            current_index = stack.pop()
+            if visited[current_index]:
+                continue
+            visited[current_index] = True
+            component.append(blocks[current_index])
+            stack.extend(adjacency[current_index])
+
+        for subgroup in _split_component_by_x_gap(component):
+            items = _sort_group_items(subgroup)
+            gx1, gy1, gx2, gy2 = _component_bounds(items)
+
+            text = " ".join(
+                item.source_text.strip()
+                for item in items
+                if item.source_text.strip()
+            ).strip()
+
+            if not text:
+                continue
+
+            merged.append(
+                TextBlock(
+                    box=[(gx1, gy1), (gx2, gy1), (gx2, gy2), (gx1, gy2)],
+                    source_text=text,
+                )
+            )
+
+    return sorted(merged, key=lambda block: (block.bounds[1], block.bounds[0]))
+
+
+def process_image_bytes(
+    content: bytes,
+    results_dir: Path,
+    source_ocr_lang: str = "en",
+    target_lang: str = "Russian",
+) -> tuple[Path, dict[str, Any]]:
+    total_started = perf_counter()
+    image = Image.open(BytesIO(content)).convert("RGB")
+    np_image = np.array(image)
+
+    digest = sha1_bytes(content)
+    debug_dir = Path(tempfile.mkdtemp(prefix=f"{digest}_debug_"))
+
+    cache_key = (digest, source_ocr_lang)
+    ocr_started = perf_counter()
+    cached_blocks = _OCR_CACHE.get(cache_key)
+    if cached_blocks is not None:
+        # Cache hit: переиспользуем OCR-результат, отдаём копии TextBlock.
+        raw_blocks = [
+            TextBlock(box=list(b.box), source_text=b.source_text)
+            for b in cached_blocks
+        ]
+        # LRU: перемещаем ключ в конец
+        _OCR_CACHE.pop(cache_key)
+        _OCR_CACHE[cache_key] = cached_blocks
+        debug_print(f"[PIPELINE] OCR cache hit digest={digest[:8]} lang={source_ocr_lang}")
+    else:
+        raw_blocks = recognize_blocks(
+            image,
+            debug_dir=debug_dir,
+            source_ocr_lang=source_ocr_lang,
+        )
+        # Сохраняем копии в кеш (без translated_text — он пустой в момент OCR)
+        if len(_OCR_CACHE) >= _OCR_CACHE_MAX:
+            _OCR_CACHE.pop(next(iter(_OCR_CACHE)))
+        _OCR_CACHE[cache_key] = [
+            TextBlock(box=list(b.box), source_text=b.source_text)
+            for b in raw_blocks
+        ]
+    ocr_ms = round((perf_counter() - ocr_started) * 1000)
+    debug_print(f"[PIPELINE] blocks recognized raw: {len(raw_blocks)}")
+
+    group_started = perf_counter()
+    region_ids, regions = _assign_region_ids(raw_blocks, np_image)
+    blocks = group_blocks(raw_blocks, np_image, region_ids=region_ids)
+    group_ms = round((perf_counter() - group_started) * 1000)
+    debug_print(f"[PIPELINE] blocks grouped: {len(blocks)}")
+
+    # Фильтр по длине ПОСЛЕ группировки: иначе короткие слова-мости
+    # (and/is/used) выпадут и блоки потеряют связность.
+    pre_len_filter = len(blocks)
+    blocks = [b for b in blocks if len((b.source_text or "").strip()) >= 5]
+    if len(blocks) < pre_len_filter:
+        debug_print(
+            f"[PIPELINE] filtered {pre_len_filter - len(blocks)} short block(s) "
+            f"after grouping (len < 5)"
+        )
+
+    debug_img = np_image.copy()
+    region_debug_img = np_image.copy()
+    for region_index, region in enumerate(regions, start=1):
+        cv2.rectangle(
+            region_debug_img,
+            (region.x1, region.y1),
+            (region.x2, region.y2),
+            (0, 180, 0),
+            2,
+        )
+        cv2.putText(
+            region_debug_img,
+            str(region_index),
+            (region.x1, max(20, region.y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 180, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    Image.fromarray(region_debug_img).save(debug_dir / "text_regions.png")
+
+    for i, block in enumerate(blocks, start=1):
+        x1, y1, x2, y2 = block.bounds
+        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(
+            debug_img,
+            str(i),
+            (x1, max(20, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    Image.fromarray(debug_img).save(debug_dir / "grouped_blocks.png")
+
+    from .translator import get_translator
+
+    translator_started = perf_counter()
+    translator = get_translator()
+
+    texts = [block.source_text for block in blocks]
+    translatable_flags = [looks_translatable(t) for t in texts]
+    for i, (text, ok) in enumerate(zip(texts, translatable_flags), start=1):
+        status = "OK" if ok else "SKIP"
+        debug_print(f"[PIPELINE] source[{i}] [{status}]: {text!r}")
+
+    # Отправляем на перевод только осмысленные блоки,
+    # для мусора сразу подставляем пустую строку
+    texts_to_translate = [t if ok else "" for t, ok in zip(texts, translatable_flags)]
+    n_skip = sum(1 for t in texts_to_translate if not t)
+    if n_skip:
+        debug_print(f"[PIPELINE] skipping {n_skip}/{len(texts)} blocks before translation")
+
+    translation_started = perf_counter()
+    translated_texts = translator.translate_batch(texts_to_translate, target_language=target_lang)
+    translation_ms = round((perf_counter() - translation_started) * 1000)
+
+    translator.reset()
+
+    for i, (block, translated) in enumerate(zip(blocks, translated_texts), start=1):
+        block.translated_text = translated
+        debug_print(f"[PIPELINE] translated[{i}]: {translated!r}")
+
+    blocks_to_render = [b for b in blocks if b.translated_text]
+    n_skip = len(blocks) - len(blocks_to_render)
+    if n_skip:
+        debug_print(f"[PIPELINE] skipping {n_skip} blocks from inpaint/render")
+
+    inpaint_started = perf_counter()
+    cleaned, block_masks = inpaint_text(np_image, blocks_to_render)
+    inpaint_ms = round((perf_counter() - inpaint_started) * 1000)
+
+    render_started = perf_counter()
+    rendered = render_translations(cleaned, blocks_to_render, original_image=np_image, block_masks=block_masks)
+    render_ms = round((perf_counter() - render_started) * 1000)
+
+    save_started = perf_counter()
+    out_path = results_dir / f"{digest}.png"
+    rendered.save(out_path)
+    save_ms = round((perf_counter() - save_started) * 1000)
+    translator_init_ms = round((translation_started - translator_started) * 1000)
+    total_ms = round((perf_counter() - total_started) * 1000)
+
+    # Чистим временную debug-папку — в results/ остаётся только финальный PNG
+    shutil.rmtree(debug_dir, ignore_errors=True)
+
+    meta = {
+        "source_ocr_lang": source_ocr_lang,
+        "target_lang": target_lang,
+        "boxes_detected": len(raw_blocks),
+        "region_candidates": len(regions),
+        "boxes_grouped": len(blocks),
+        "boxes_used": len(blocks_to_render),
+        "source_texts": [block.source_text for block in blocks],
+        "translated_texts": [block.translated_text for block in blocks],
+        "timings_ms": {
+            "ocr": ocr_ms,
+            "group": group_ms,
+            "translator_init": translator_init_ms,
+            "translate": translation_ms,
+            "inpaint": inpaint_ms,
+            "render": render_ms,
+            "save": save_ms,
+            "total": total_ms,
+        },
+    }
+
+    debug_print("[PIPELINE] meta =", json.dumps(meta, ensure_ascii=False, indent=2))
+    return out_path, meta
