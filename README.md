@@ -54,7 +54,7 @@ python translate_catalog.py \
 | Флаг | Описание |
 |---|---|
 | `--in DIR` | Каталог с изображениями (только верхний уровень) |
-| `--source LANG` | Код OCR для PaddleOCR (`en`, `ru`, `ch`, `japan`, `korean`, …) |
+| `--source LANG` | Исходный язык (`en`, `ru`, `ch`, `japan`, `korean`, …) |
 | `--target LANG` | Целевой язык: `ru`/`rus`/`Russian`, `en`/`eng`/`English`, … |
 | `--out DIR` | Корневая папка результатов (default: `./result`) |
 | `--format EXT` | Расширение выходных файлов: `png` / `jpg` / `webp` (default: `png`) |
