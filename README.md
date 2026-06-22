@@ -63,6 +63,31 @@ python translate_catalog.py \
 
 `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`.
 
+### Поддерживаемые языки
+
+18 языков с алиасами:
+
+| Код (`--target`) | Полное имя (модель) | Локальное |
+|---|---|---|
+| `ru` / `rus` | `Russian` | Русский |
+| `en` / `eng` | `English` | Английский |
+| `zh` / `ch` | `Chinese` | Китайский |
+| `ja` / `japan` | `Japanese` | Японский |
+| `ko` / `korean` | `Korean` | Корейский |
+| `fr` / `fra` | `French` | Французский |
+| `de` / `deu` | `German` | Немецкий |
+| `es` / `spa` | `Spanish` | Испанский |
+| `pt` / `por` | `Portuguese` | Португальский |
+| `it` / `ita` | `Italian` | Итальянский |
+| `tr` / `tur` | `Turkish` | Турецкий |
+| `ar` / `ara` | `Arabic` | Арабский |
+| `th` / `tha` | `Thai` | Тайский |
+| `vi` / `vie` | `Vietnamese` | Вьетнамский |
+| `pl` / `pol` | `Polish` | Польский |
+| `nl` / `nld` | `Dutch` | Голландский |
+| `cs` / `ces` | `Czech` | Чешский |
+| `hi` / `hin` | `Hindi` | Хинди |
+
 ### Выход
 
 ```
