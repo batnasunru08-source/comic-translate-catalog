@@ -1,24 +1,28 @@
-# comic-translate-catalog
+# translate_catalog
 
-CLI для пакетного перевода изображений из каталога.
+CLI для пакетного перевода изображений из каталога. Использует ту же логику
+OCR + перевод + inpaint + render, что и FastAPI-сервер, но запускается
+отдельным процессом без HTTP.
 
 ## Структура
 
 ```
 translate_catalog/
 ├── translate_catalog.py     # CLI entry point
-├── app/                     # движок
-├── data/                    # для фильтрации слов перевода
+├── app/                     # vendored server/app/
+├── data/                    # vendored server/data/
 ├── models/                  # сюда класть .gguf
-├── requirements.txt         # CLI-зависимости
+├── requirements.txt         # CLI-зависимости (без fastapi/uvicorn)
 ├── install.sh               # .venv + pip install
 ├── download-model.sh        # скачать GGUF
 ├── result/                  # создаётся при первом запуске
+└── .venv/                   # создаётся install.sh
 ```
 
 ## Установка
 
 ```bash
+cd /home/batnasun/translate_catalog
 bash install.sh
 ```
 
@@ -54,7 +58,7 @@ python translate_catalog.py \
 | Флаг | Описание |
 |---|---|
 | `--in DIR` | Каталог с изображениями (только верхний уровень) |
-| `--source LANG` | Исходный язык (`en`, `ru`, `ch`, `japan`, `korean`, …) |
+| `--source LANG` | Код OCR для PaddleOCR (`en`, `ru`, `ch`, `japan`, `korean`, …) |
 | `--target LANG` | Целевой язык: `ru`/`rus`/`Russian`, `en`/`eng`/`English`, … |
 | `--out DIR` | Корневая папка результатов (default: `./result`) |
 | `--format EXT` | Расширение выходных файлов: `png` / `jpg` / `webp` (default: `png`) |
@@ -65,9 +69,11 @@ python translate_catalog.py \
 
 ### Поддерживаемые языки
 
-18 языков с алиасами:
+**`--target`** — язык перевода. Принимает ISO 639-1, ISO 639-3 или полное
+английское имя (модель `Hy-MT2` ожидает полное имя). 19 языков с алиасами:
 
-| Варианты для ввода |
+| Код (`--target`) | Полное имя (модель) | Локальное |
+|---|---|---|
 | `ru` / `rus` | `Russian` | Русский |
 | `en` / `eng` | `English` | Английский |
 | `zh` / `ch` | `Chinese` | Китайский |
@@ -86,6 +92,20 @@ python translate_catalog.py \
 | `nl` / `nld` | `Dutch` | Голландский |
 | `cs` / `ces` | `Czech` | Чешский |
 | `hi` / `hin` | `Hindi` | Хинди |
+| `uk` / `ukr` | `Ukrainian` | Украинский |
+
+Hy-MT2 также поддерживает `Indonesian`, `Malay`, `Filipino`, `Burmese`,
+`Khmer`, `Persian`, `Urdu`, `Hebrew`, `Bengali`, `Tamil`, `Telugu`, `Marathi`,
+`Gujarati`, `Traditional Chinese`, `Kazakh`, `Mongolian`, `Tibetan`, `Cantonese`
+и др. — передавайте полное имя напрямую: `--target Indonesian`,
+`--target Traditional Chinese`.
+
+**`--source`** — код для PaddleOCR. Полный список смотрите в документации
+PaddleOCR (https://www.paddleocr.ai/latest/en/version3.x/module_usage/ocr.html).
+Часто используемые: `en` (английский), `ch` / `chinese_cht` (китайский),
+`japan` (японский), `korean` (корейский), `ru` (русский), `fr` (французский),
+`de` (немецкий), `ar` (арабский), `hi` (хинди), `pt` (португальский),
+`es` (испанский), `it` (итальянский).
 
 ### Выход
 
@@ -102,13 +122,21 @@ result/<input_dir_basename>_translate/
 
 ```bash
 python translate_catalog.py \
-    --in "/path/to/images" \
+    --in "./[BDOne] Prince_ Chapter" \
     --source en \
     --target rus
 ```
 
 Результат: `result/[BDOne] Prince_ Chapter_translate/` с 26 PNG (по числу .webp).
 
+## Заметки
+
+- Логика перевода скопирована из `server/app/` (vendor). При правках в
+  `server/app/*.py` нужно вручную синхронизировать изменения.
+- Между изображениями вызывается `HyMt2Translator.reset()` (KV-кеш чистится)
+  — VRAM возвращается к исходному уровню.
+- OCR-кеш в `app.pipeline` (LRU, 8 записей) переиспользуется между
+  изображениями в рамках одного запуска.
 
 ## Отладка
 
@@ -118,7 +146,7 @@ inpaint details) включите debug-режим:
 
 ```bash
 TRANSLATE_DEBUG=1 python translate_catalog.py \
-    --in "/path/to/images" \
+    --in "./[BDOne] Prince_ Chapter" \
     --source en \
     --target rus
 ```

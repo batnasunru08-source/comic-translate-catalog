@@ -5,6 +5,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 JP_RE = re.compile(r"[一-龯ぁ-ゔァ-ヴー々〆〤]")
 LATIN_RE = re.compile(r"[A-Za-z]")
@@ -63,10 +64,10 @@ def first_existing_path(candidates: list[str]) -> str | None:
     return None
 
 
-_translation_filter_cache: dict[str, tuple[float, dict[str, frozenset[str]]]] = {}
+_translation_filter_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
-def load_translation_filter(config_path: Path | None = None) -> dict[str, frozenset[str]]:
+def load_translation_filter(config_path: Path | None = None) -> dict[str, Any]:
     """Загружает фильтр слов, которые не надо переводить.
 
     По умолчанию ищет config в server/data/translation_filter.json.
@@ -77,7 +78,14 @@ def load_translation_filter(config_path: Path | None = None) -> dict[str, frozen
         config_path = Path(__file__).resolve().parent.parent / "data" / "translation_filter.json"
 
     if not config_path.exists():
-        return {"watermark_tokens": frozenset(), "known_repeats": frozenset()}
+        return {
+            "watermark_tokens": frozenset(),
+            "known_repeats": frozenset(),
+            "noise_tokens": frozenset(),
+            "huge_block_area_ratio": 0.20,
+            "huge_block_min_chars": 30,
+            "huge_block_min_density": 0.0003,
+        }
 
     key = str(config_path)
     mtime = config_path.stat().st_mtime
@@ -92,6 +100,11 @@ def load_translation_filter(config_path: Path | None = None) -> dict[str, frozen
         "watermark_tokens": frozenset(t.lower() for t in data.get("watermark_tokens", [])),
         "known_repeats": frozenset(t.lower() for t in data.get("known_repeats", [])),
         "noise_tokens": frozenset(t.lower() for t in data.get("noise_tokens", [])),
+        # Пороги фильтра огромных блоков (см. pipeline._filter_huge_blocks).
+        # Дефолты — для обратной совместимости со старым filter.json без этих ключей.
+        "huge_block_area_ratio": float(data.get("huge_block_area_ratio", 0.20)),
+        "huge_block_min_chars": int(data.get("huge_block_min_chars", 30)),
+        "huge_block_min_density": float(data.get("huge_block_min_density", 0.0003)),
     }
     _translation_filter_cache[key] = (mtime, result)
     return result
