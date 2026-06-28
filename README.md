@@ -124,7 +124,7 @@ python translate_catalog.py \
     --target rus
 ```
 
-Результат: `result/[BDOne] Prince_ Chapter_translate/` с 26 PNG (по числу .webp).
+Результат: `result/path_example_translate/` с 26 PNG (по числу .webp).
 
 ## Заметки
 
