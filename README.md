@@ -90,7 +90,6 @@ python translate_catalog.py \
 | `nl` / `nld` | `Dutch` | Голландский |
 | `cs` / `ces` | `Czech` | Чешский |
 | `hi` / `hin` | `Hindi` | Хинди |
-| `uk` / `ukr` | `Ukrainian` | Украинский |
 
 Hy-MT2 также поддерживает `Indonesian`, `Malay`, `Filipino`, `Burmese`,
 `Khmer`, `Persian`, `Urdu`, `Hebrew`, `Bengali`, `Tamil`, `Telugu`, `Marathi`,
